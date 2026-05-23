@@ -118,7 +118,7 @@ export class AgentManager {
     const reply = await this.readLatestReply(page, agent);
     this.lastReplies.set(id, reply);
     this.emitStatus(id, "done");
-    this.broadcast({ type: "chat-result", agentId: id, reply });
+    this.broadcast({ type: "chat-result", agentId: id, agentName: agent.name, reply });
     return { agentId: id, reply };
   }
 
@@ -197,16 +197,16 @@ export class AgentManager {
       const outgoingMessage = this.withAgentRule(agent, message);
       await this.fillAndSend(page, agent, this.normalizeOutgoingMessage(agent, outgoingMessage, attachments));
       await this.handleAfterSubmit(page, agent);
-      this.broadcast({ type: "message-sent", agentId: agent.id, message: this.formatSentMessage(outgoingMessage, attachments) });
+      this.broadcast({ type: "message-sent", agentId: agent.id, agentName: agent.name, message: this.formatSentMessage(outgoingMessage, attachments) });
       this.emitStatus(agent.id, "waiting");
       const reply = await this.waitForReply(page, agent, attachments.length > 0 ? ATTACHMENT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
       this.lastReplies.set(agent.id, reply);
       this.emitStatus(agent.id, "done");
-      this.broadcast({ type: "chat-result", agentId: agent.id, reply });
+      this.broadcast({ type: "chat-result", agentId: agent.id, agentName: agent.name, reply });
       return { agentId: agent.id, ok: true, reply };
     } catch (error) {
       this.emitStatus(agent.id, "error");
-      this.broadcast({ type: "chat-error", agentId: agent.id, error: error.message });
+      this.broadcast({ type: "chat-error", agentId: agent.id, agentName: agent.name, error: error.message });
       return { agentId: agent.id, ok: false, error: error.message };
     }
   }

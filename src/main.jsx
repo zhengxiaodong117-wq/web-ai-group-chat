@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -48,6 +48,17 @@ function App() {
   const [summaryInstruction, setSummaryInstruction] = useState("请综合这些 AI 的回答，提炼共同结论、主要分歧、各自优缺点，最后给出一份更完整、更可靠的汇总答案。");
   const [ruleDialog, setRuleDialog] = useState(null);
   const [rulePrompt, setRulePrompt] = useState("");
+  const [hermesMode, setHermesMode] = useState(false);
+  const [hermesOpen, setHermesOpen] = useState(false);
+  const [hermesState, setHermesState] = useState({ context: [], lastReply: "", lastError: "", busy: false, available: false });
+  const [hermesSettings, setHermesSettings] = useState({ runtime: "wsl", target: "", targetLabel: "" });
+  const [hermesTargets, setHermesTargets] = useState({ runtime: "wsl", conversations: [], channels: [] });
+  const [hermesConfigOpen, setHermesConfigOpen] = useState(false);
+  const [hermesConfigBusy, setHermesConfigBusy] = useState(false);
+  const [hermesDraft, setHermesDraft] = useState("");
+  const [hermesWindow, setHermesWindow] = useState(() => readHermesWindow());
+  const [hermesMaximized, setHermesMaximized] = useState(false);
+  const dragState = useRef(null);
 
   useEffect(() => {
     loadInitialState();
@@ -74,27 +85,35 @@ function App() {
         setHistory([]);
         setAgents((items) => items.map((item) => ({ ...item, lastSent: "", lastReply: "", lastError: "" })));
       }
+      if (data.type === "hermes-state") setHermesState(data.state);
+      if (data.type === "hermes-settings") setHermesSettings(data.settings);
     });
     return () => socket.close();
   }, []);
 
   const visibleAgents = useMemo(() => agents.slice(0, settings.displayCount), [agents, settings.displayCount]);
   const enabledCount = useMemo(() => visibleAgents.filter((agent) => agent.enabled).length, [visibleAgents]);
+  const hermesReadableAgents = useMemo(() => visibleAgents.filter((agent) => agent.lastReply), [visibleAgents]);
   const localAddress = useMemo(() => chooseLanAddress(network), [network]);
   const activeUrl = accessMode === "internet" ? network.tunnelUrl : localAddress;
   const networkStopped = accessMode === "internet" && !network.tunnelUrl;
 
   async function loadInitialState() {
-    const [agentsRes, modelsRes, settingsRes, networkRes] = await Promise.all([
+    const [agentsRes, modelsRes, settingsRes, networkRes, hermesRes, hermesSettingsRes] = await Promise.all([
       fetch("/api/agents"),
       fetch("/api/models"),
       fetch("/api/settings"),
-      fetch("/api/network")
+      fetch("/api/network"),
+      fetch("/api/hermes/state"),
+      fetch("/api/hermes/settings")
     ]);
     setAgents(await agentsRes.json());
     setModels(await modelsRes.json());
     setSettings(await settingsRes.json());
     setNetwork(await networkRes.json());
+    setHermesState(await hermesRes.json());
+    setHermesSettings(await hermesSettingsRes.json());
+    refreshHermesTargets();
   }
 
   async function updateSettings(patch) {
@@ -145,6 +164,10 @@ function App() {
 
   async function sendMessage() {
     if ((!message.trim() && !image && fileAttachments.length === 0) || busy) return;
+    if (hermesMode) {
+      await sendMessageToHermes();
+      return;
+    }
     setBusy(true);
     setError("");
     const outgoing = message.trim();
@@ -172,6 +195,146 @@ function App() {
     });
     if (!res.ok) setError((await res.json()).error ?? "发送失败");
     setBusy(false);
+  }
+
+  async function sendMessageToHermes() {
+    await sendTextToHermes(message, true);
+  }
+
+  async function sendHermesDraft() {
+    await sendTextToHermes(hermesDraft, false);
+  }
+
+  async function sendTextToHermes(text, fromMainInput) {
+    if (!text.trim() || busy || hermesState.busy) return;
+    setBusy(true);
+    setError("");
+    const outgoing = text.trim();
+    if (fromMainInput) {
+      setHistory((items) => [{ id: crypto.randomUUID(), message: `[Hermes] ${outgoing}`, time: new Date().toLocaleTimeString() }, ...items].slice(0, 8));
+      setMessage("");
+    } else {
+      setHermesDraft("");
+    }
+    setHermesOpen(true);
+
+    const res = await fetch("/api/hermes/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: outgoing })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setHermesState(data.state);
+      setHermesOpen(true);
+    } else {
+      setError((await res.json()).error ?? "Hermes 发送失败");
+    }
+    setBusy(false);
+  }
+
+  async function analyzeWithHermes(instruction = "") {
+    if (busy || hermesState.busy || hermesReadableAgents.length === 0) return;
+    setBusy(true);
+    setError("");
+    const analysisInstruction = typeof instruction === "string" ? instruction.trim() : "";
+    const res = await fetch("/api/hermes/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction: analysisInstruction })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setHermesState(data.state);
+      setHermesOpen(true);
+      if (analysisInstruction) setHermesDraft("");
+    } else {
+      setError((await res.json()).error ?? "Hermes 分析失败");
+    }
+    setBusy(false);
+  }
+
+  async function clearHermes() {
+    const res = await fetch("/api/hermes/clear", { method: "POST" });
+    if (res.ok) setHermesState(await res.json());
+  }
+
+  async function refreshHermesTargets() {
+    setHermesConfigBusy(true);
+    const res = await fetch("/api/hermes/conversations");
+    if (res.ok) setHermesTargets(await res.json());
+    else setError((await res.json()).error ?? "读取 Hermes 会话失败");
+    setHermesConfigBusy(false);
+  }
+
+  async function saveHermesTarget(target, targetLabel) {
+    setHermesConfigBusy(true);
+    const res = await fetch("/api/hermes/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ runtime: "wsl", target, targetLabel })
+    });
+    if (res.ok) setHermesSettings(await res.json());
+    else setError((await res.json()).error ?? "保存 Hermes 配置失败");
+    setHermesConfigBusy(false);
+  }
+
+  function startHermesDrag(event) {
+    if (hermesMaximized) return;
+    if (event.button !== 0) return;
+    if (event.target.closest("button, select, input, textarea")) return;
+    dragState.current = {
+      x: event.clientX,
+      y: event.clientY,
+      left: hermesWindow.left,
+      top: hermesWindow.top
+    };
+    window.addEventListener("pointermove", moveHermesWindow);
+    window.addEventListener("pointerup", stopHermesDrag, { once: true });
+  }
+
+  function moveHermesWindow(event) {
+    const state = dragState.current;
+    if (!state) return;
+    const next = clampHermesWindow({
+      ...hermesWindow,
+      left: state.left + event.clientX - state.x,
+      top: state.top + event.clientY - state.y
+    });
+    dragState.current.last = next;
+    setHermesWindow(next);
+  }
+
+  function stopHermesDrag() {
+    window.removeEventListener("pointermove", moveHermesWindow);
+    if (dragState.current?.last) saveHermesWindow(dragState.current.last);
+    dragState.current = null;
+  }
+
+  function resizeHermesWindow(width, height) {
+    if (hermesMaximized) return;
+    const next = clampHermesWindow({ ...hermesWindow, width, height });
+    setHermesWindow(next);
+    saveHermesWindow(next);
+  }
+
+  function toggleHermesMaximize() {
+    setHermesMaximized((value) => !value);
+  }
+
+  function toggleHermesMode() {
+    setHermesMode((value) => {
+      const next = !value;
+      setHermesOpen(next);
+      if (!next) setHermesConfigOpen(false);
+      return next;
+    });
+  }
+
+  function closeHermesPanel() {
+    setHermesOpen(false);
+    setHermesMode(false);
+    setHermesConfigOpen(false);
   }
 
   async function selectImage(file) {
@@ -487,9 +650,17 @@ function App() {
               <IconFile />
               File
             </label>
-            <button className="primary icon-text-button" disabled={(!message.trim() && !image && fileAttachments.length === 0) || busy || enabledCount === 0} onClick={sendMessage}>
+            <button className="primary icon-text-button" disabled={hermesMode ? (!message.trim() || busy || hermesState.busy) : ((!message.trim() && !image && fileAttachments.length === 0) || busy || enabledCount === 0)} onClick={sendMessage}>
               <IconSend />
-              {busy ? "Sending" : "Send"}
+              {busy ? "Sending" : hermesMode ? "To Hermes" : "Send"}
+            </button>
+            <button className={hermesMode ? "icon-text-button hermes-button active" : "icon-text-button hermes-button"} disabled={busy || hermesState.busy} onClick={toggleHermesMode} title="Hermes">
+              <IconHermes />
+              Hermes
+            </button>
+            <button className="icon-text-button hermes-button" disabled={busy || hermesState.busy} onClick={() => setHermesOpen(true)} title="打开 Hermes 分析">
+              <IconSummary />
+              Analyze
             </button>
             <button className="icon-text-button" disabled={busy} onClick={clearChat}>
               <IconClear />
@@ -643,6 +814,131 @@ function App() {
         </div>
       )}
 
+      {hermesOpen && (
+        <aside
+          className={hermesMaximized ? "hermes-float maximized" : "hermes-float"}
+          aria-label="Hermes 会话窗口"
+          style={hermesMaximized ? undefined : {
+            left: hermesWindow.left,
+            top: hermesWindow.top,
+            width: hermesWindow.width,
+            height: hermesWindow.height
+          }}
+        >
+          <div className="hermes-float-head" onPointerDown={startHermesDrag}>
+            <div>
+              <strong>Hermes</strong>
+              <span>{hermesState.busy ? "分析中" : hermesMode ? "发送到 Hermes" : "待命"}</span>
+            </div>
+            <div className="hermes-head-actions">
+              <button className="text-button" disabled={hermesState.busy || hermesState.context.length === 0} onClick={clearHermes} title="Clear">
+                Clear
+              </button>
+              <button className="icon-button" disabled={hermesConfigBusy} onClick={(event) => {
+                event.stopPropagation();
+                setHermesConfigOpen((value) => !value);
+                if (!hermesConfigOpen) refreshHermesTargets();
+              }} title="Hermes 配置" aria-label="Hermes 配置">
+                <IconSettings />
+              </button>
+              <button className="icon-button" onClick={toggleHermesMaximize} title={hermesMaximized ? "还原" : "最大化"} aria-label={hermesMaximized ? "还原" : "最大化"}>
+                {hermesMaximized ? <IconRestore /> : <IconMaximize />}
+              </button>
+              <button className="icon-button" onClick={closeHermesPanel} title="关闭" aria-label="关闭">
+                <IconClose />
+              </button>
+            </div>
+          </div>
+          {!hermesState.available && <div className="hermes-float-actions"><span className="error-text">未检测到 Hermes</span></div>}
+          {hermesConfigOpen && (
+            <div className="hermes-config">
+              <div className="hermes-config-head">
+                <strong>WSL Hermes 连接配置</strong>
+                <button disabled={hermesConfigBusy} onClick={refreshHermesTargets}>{hermesConfigBusy ? "刷新中" : "刷新"}</button>
+              </div>
+              <label>
+                发送目标
+                <select
+                  value={hermesSettings.target}
+                  onChange={(event) => {
+                    const option = [...event.currentTarget.options].find((item) => item.value === event.target.value);
+                    saveHermesTarget(event.target.value, option?.dataset.label ?? "");
+                  }}
+                >
+                  <option value="" data-label="">独立 Hermes 对话（不发送到微信/飞书）</option>
+                  {hermesTargets.conversations.map((item) => (
+                    <option value={item.target} data-label={`${item.platform} ${item.name}`} key={item.sessionKey}>
+                      {item.platform} / {item.chatType} / {item.name}
+                    </option>
+                  ))}
+                  {hermesTargets.channels.map((item) => (
+                    <option value={item.target} data-label={`${item.platform} ${item.name}`} key={item.target}>
+                      {item.platform} / {item.chatType || "channel"} / {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <span className="hermes-config-note">
+                当前：{hermesSettings.target ? `${hermesSettings.targetLabel || hermesSettings.target}` : `独立 Hermes 对话${hermesSettings.sessionId ? ` / ${hermesSettings.sessionId}` : ""}`}
+              </span>
+              {hermesTargets.error && <span className="hermes-error">{hermesTargets.error}</span>}
+            </div>
+          )}
+          {hermesState.lastError && <div className="hermes-error">{hermesState.lastError}</div>}
+          <div className="hermes-chat">
+            {hermesState.context.length === 0 ? (
+              <span className="empty-note">暂无会话。点亮 Hermes 后发送消息，或让 AI 回复后点 Analyze all。</span>
+            ) : hermesState.context.map((item) => (
+              <article className={`hermes-bubble ${item.role}`} key={item.id}>
+                <div>
+                  <strong>{item.title}</strong>
+                  <span>{item.role === "ai" ? (item.status || "collected") : item.time}</span>
+                </div>
+                {item.role === "ai" ? (
+                  <span className="hermes-status-line">Collected for analysis</span>
+                ) : (
+                  <pre>{item.text}</pre>
+                )}
+              </article>
+              ))}
+          </div>
+          <div className="hermes-compose">
+            <div className="hermes-input-wrap">
+              <textarea
+                value={hermesDraft}
+                onChange={(event) => setHermesDraft(event.target.value)}
+                placeholder="Message Hermes or ask: Compare these replies, identify the most reliable answer, and point out omissions"
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    sendHermesDraft();
+                  }
+                }}
+              />
+              <div className="hermes-compose-actions">
+                <button className="text-button" disabled={busy || hermesState.busy || hermesReadableAgents.length === 0} onClick={() => analyzeWithHermes(hermesDraft)} title="按输入要求分析主界面回复">
+                  {hermesState.busy ? "Analyzing" : "Analyze"}
+                </button>
+                <button className="icon-button" disabled={!hermesDraft.trim() || busy || hermesState.busy} onClick={sendHermesDraft} title="发送给 Hermes" aria-label="发送给 Hermes">
+                  <IconSend />
+                </button>
+              </div>
+            </div>
+          </div>
+          {!hermesMaximized && <div className="hermes-resize-grip" title="拖动调整大小" onPointerDown={(event) => {
+            event.preventDefault();
+            const start = { x: event.clientX, y: event.clientY, width: hermesWindow.width, height: hermesWindow.height };
+            const onMove = (moveEvent) => resizeHermesWindow(start.width + moveEvent.clientX - start.x, start.height + moveEvent.clientY - start.y);
+            const onUp = () => {
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+            };
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp);
+          }} />}
+        </aside>
+      )}
+
       <section className="history">
         <h2>最近发送</h2>
         {history.length === 0 ? <p>暂无</p> : history.map((item) => <p key={item.id}><span>{item.time}</span>{item.message}</p>)}
@@ -731,6 +1027,46 @@ function IconRules() {
   );
 }
 
+function IconHermes() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7z" />
+      <path d="M8 9h8" />
+      <path d="M9 13h6" />
+      <path d="M10 17h4" />
+    </svg>
+  );
+}
+
+function IconSettings() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6l-.09.09a2 2 0 0 1-3.82 0L10 20a1.7 1.7 0 0 0-1-.6 1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1l-.09-.09a2 2 0 0 1 0-3.82L4 10a1.7 1.7 0 0 0 .6-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6l.09-.09a2 2 0 0 1 3.82 0L14 4a1.7 1.7 0 0 0 1 .6 1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.2.36.4.7.6 1l.09.09a2 2 0 0 1 0 3.82L20 14a1.7 1.7 0 0 0-.6 1z" />
+    </svg>
+  );
+}
+
+function IconMaximize() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M8 4H4v4" />
+      <path d="M16 4h4v4" />
+      <path d="M20 16v4h-4" />
+      <path d="M4 16v4h4" />
+    </svg>
+  );
+}
+
+function IconRestore() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="7" y="7" width="10" height="10" rx="1" />
+      <path d="M10 4h10v10" />
+    </svg>
+  );
+}
+
 function IconClose() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -805,6 +1141,47 @@ function isAllowedFile(file) {
   const allowedExtensions = [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".md"];
   const lowerName = file.name.toLowerCase();
   return allowedExtensions.some((extension) => lowerName.endsWith(extension));
+}
+
+function readHermesWindow() {
+  const fallback = defaultHermesWindow();
+  try {
+    const value = JSON.parse(localStorage.getItem("hermes-window") || "null");
+    return clampHermesWindow({ ...fallback, ...value });
+  } catch {
+    return fallback;
+  }
+}
+
+function saveHermesWindow(value) {
+  try {
+    localStorage.setItem("hermes-window", JSON.stringify(clampHermesWindow(value)));
+  } catch {
+    // Ignore storage failures; window dragging should still work.
+  }
+}
+
+function defaultHermesWindow() {
+  const width = Math.min(430, Math.max(320, window.innerWidth - 24));
+  const height = Math.min(680, Math.max(360, window.innerHeight - 36));
+  return {
+    width,
+    height,
+    left: Math.max(12, window.innerWidth - width - 18),
+    top: Math.max(12, window.innerHeight - height - 18)
+  };
+}
+
+function clampHermesWindow(value) {
+  const margin = 10;
+  const width = Math.min(Math.max(Number(value.width) || 430, 320), Math.max(320, window.innerWidth - margin * 2));
+  const height = Math.min(Math.max(Number(value.height) || 520, 300), Math.max(300, window.innerHeight - margin * 2));
+  return {
+    width,
+    height,
+    left: Math.min(Math.max(Number(value.left) || margin, margin), Math.max(margin, window.innerWidth - width - margin)),
+    top: Math.min(Math.max(Number(value.top) || margin, margin), Math.max(margin, window.innerHeight - height - margin))
+  };
 }
 
 createRoot(document.getElementById("root")).render(<App />);

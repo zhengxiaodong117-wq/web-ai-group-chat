@@ -19,11 +19,18 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 let tunnel = null;
 let tunnelUrl = "";
 let tunnelLog = "";
+const hermesState = {
+  context: [],
+  lastReply: "",
+  lastError: "",
+  busy: false
+};
 const manager = new AgentManager({
   configPath: path.join(rootDir, "config", "agents.json"),
   settingsPath: path.join(rootDir, "config", "settings.json"),
+  hermesSettingsPath: path.join(rootDir, "config", "hermes.json"),
   profileDir: path.join(rootDir, ".browser-profiles"),
-  broadcast: (event) => broadcast(event)
+  broadcast: (event) => appBroadcast(event)
 });
 
 app.use(express.json({ limit: "45mb" }));
@@ -102,6 +109,125 @@ app.post("/api/chat/send", async (req, res) => {
   } finally {
     await cleanupAttachments(attachments);
   }
+});
+
+app.get("/api/hermes/state", (_req, res) => {
+  res.json(readHermesState());
+});
+
+app.get("/api/hermes/settings", async (_req, res) => {
+  res.json(await readHermesSettings());
+});
+
+app.put("/api/hermes/settings", async (req, res) => {
+  try {
+    const settings = await writeHermesSettings(req.body ?? {});
+    appBroadcast({ type: "hermes-settings", settings });
+    res.json(settings);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/hermes/conversations", async (_req, res) => {
+  try {
+    res.json(await listHermesConversations());
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/hermes/send", async (req, res) => {
+  const { message = "" } = req.body ?? {};
+  if (typeof message !== "string" || !message.trim()) {
+    res.status(400).json({ error: "message is required" });
+    return;
+  }
+
+  try {
+    const settings = await readHermesSettings();
+    if (settings.target) {
+      const result = await sendHermesPlatformMessage(settings.target, message.trim(), settings.runtime);
+      rememberHermesContext("user", `发送到 ${settings.targetLabel || settings.target}`, message.trim());
+      hermesState.lastReply = `已发送到 ${settings.targetLabel || settings.target}`;
+      hermesState.lastError = "";
+      appBroadcast({ type: "hermes-state", state: readHermesState() });
+      res.json({ reply: hermesState.lastReply, result, state: readHermesState() });
+      return;
+    }
+
+    const reply = await runHermes([
+      "你是网页 AI 群聊里的 Hermes 分析助手。",
+      "请直接回复用户这条消息：",
+      "",
+      message.trim()
+    ].join("\n"), settings.runtime);
+    rememberHermesContext("user", "发送给 Hermes", message.trim());
+    rememberHermesContext("hermes", "Hermes 回复", reply);
+    hermesState.lastReply = reply;
+    hermesState.lastError = "";
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
+    res.json({ reply, state: readHermesState() });
+  } catch (error) {
+    hermesState.lastError = error.message;
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/hermes/analyze", async (req, res) => {
+  const instruction = typeof req.body?.instruction === "string" ? req.body.instruction.trim() : "";
+  const settings = await manager.readSettings();
+  const collected = (await manager.listAgents())
+    .slice(0, settings.displayCount)
+    .filter((agent) => typeof agent.lastReply === "string" && agent.lastReply.trim())
+    .map((agent) => ({
+      id: crypto.randomUUID(),
+      role: "ai",
+      title: agent.name,
+      text: agent.lastReply.trim(),
+      status: "collected",
+      time: new Date().toLocaleTimeString()
+    }));
+
+  hermesState.context = collected;
+
+  const context = collected
+    .map((item) => [`[${item.time}] ${item.title}`, item.text].join("\n"))
+    .join("\n\n---\n\n");
+
+  if (!context.trim()) {
+    res.status(400).json({ error: "Hermes context is empty" });
+    return;
+  }
+
+  try {
+    const hermesSettings = await readHermesSettings();
+    const reply = await runHermes([
+      "你是网页 AI 群聊里的 Hermes 总分析助手。",
+      "下面是用户消息和所有 AI 已读回的回复。请全文分析，提炼共同结论、主要分歧、遗漏风险、可执行建议，最后给出一份清晰完整的综合结论。",
+      instruction ? `用户本次分析要求：${instruction}` : "",
+      "",
+      context
+    ].join("\n"), hermesSettings.runtime);
+    rememberHermesContext("hermes", "Hermes 全文分析", reply);
+    hermesState.lastReply = reply;
+    hermesState.lastError = "";
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
+    res.json({ reply, state: readHermesState() });
+  } catch (error) {
+    hermesState.lastError = error.message;
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/hermes/clear", (_req, res) => {
+  hermesState.context = [];
+  hermesState.lastReply = "";
+  hermesState.lastError = "";
+  appBroadcast({ type: "hermes-state", state: readHermesState() });
+  res.json(readHermesState());
 });
 
 app.post("/api/chat/compare", async (req, res) => {
@@ -213,6 +339,344 @@ async function startCloudflareTunnel(target) {
   const started = await waitForTunnelUrl();
   broadcast({ type: "network", network: started });
   return started;
+}
+
+function appBroadcast(event) {
+  rememberHermesEvent(event);
+  broadcast(event);
+}
+
+function rememberHermesEvent(event) {
+  if (event?.type === "chat-cleared") {
+    hermesState.context = [];
+    hermesState.lastReply = "";
+    hermesState.lastError = "";
+    broadcast({ type: "hermes-state", state: readHermesState() });
+  }
+}
+
+function rememberHermesContext(role, title, text) {
+  const value = typeof text === "string" ? text.trim() : "";
+  if (!value) return;
+  hermesState.context.push({
+    id: crypto.randomUUID(),
+    role,
+    title,
+    text: value,
+    time: new Date().toLocaleTimeString()
+  });
+  hermesState.context = hermesState.context.slice(-80);
+}
+
+function readHermesState() {
+  return {
+    context: hermesState.context,
+    lastReply: hermesState.lastReply,
+    lastError: hermesState.lastError,
+    busy: hermesState.busy,
+    available: Boolean(findHermesExecutable())
+  };
+}
+
+async function readHermesSettings() {
+  const file = path.join(rootDir, "config", "hermes.json");
+  try {
+    const raw = await fs.readFile(file, "utf8");
+    return normalizeHermesSettings(JSON.parse(raw));
+  } catch {
+    return normalizeHermesSettings({});
+  }
+}
+
+async function writeHermesSettings(patch) {
+  const file = path.join(rootDir, "config", "hermes.json");
+  const current = await readHermesSettings();
+  const next = normalizeHermesSettings({ ...current, ...patch });
+  await fs.writeFile(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return next;
+}
+
+function normalizeHermesSettings(value) {
+  const runtime = ["auto", "wsl", "windows"].includes(value?.runtime) ? value.runtime : "wsl";
+  return {
+    runtime,
+    target: typeof value?.target === "string" ? value.target.trim().slice(0, 300) : "",
+    targetLabel: typeof value?.targetLabel === "string" ? value.targetLabel.trim().slice(0, 300) : "",
+    sessionId: typeof value?.sessionId === "string" ? value.sessionId.trim().slice(0, 120) : ""
+  };
+}
+
+async function listHermesConversations() {
+  const settings = await readHermesSettings();
+  const runtimes = settings.runtime === "auto" ? ["wsl", "windows"] : [settings.runtime];
+  const errors = [];
+  for (const runtime of runtimes) {
+    try {
+      const result = runtime === "wsl" ? await listWslHermesConversations() : await listWindowsHermesConversations();
+      if (result.conversations.length || result.channels.length) return { ...result, runtime };
+    } catch (error) {
+      errors.push(`${runtime}: ${error.message}`);
+    }
+  }
+  return { runtime: settings.runtime, conversations: [], channels: [], error: errors.join("\n") };
+}
+
+async function listWslHermesConversations() {
+  const script = `
+import json
+from pathlib import Path
+home = Path("/home/hermes/.hermes")
+sessions_file = home / "sessions" / "sessions.json"
+channels_file = home / "channel_directory.json"
+sessions = {}
+channels = {}
+if sessions_file.exists():
+    sessions = json.loads(sessions_file.read_text(encoding="utf-8"))
+if channels_file.exists():
+    channels = json.loads(channels_file.read_text(encoding="utf-8"))
+conversations = []
+for key, entry in sessions.items():
+    origin = entry.get("origin", {})
+    platform = entry.get("platform") or origin.get("platform", "")
+    chat_id = origin.get("chat_id", "")
+    target = f"{platform}:{chat_id}" if platform and chat_id else ""
+    conversations.append({
+        "sessionKey": key,
+        "target": target,
+        "platform": platform,
+        "chatType": entry.get("chat_type") or origin.get("chat_type", ""),
+        "name": entry.get("display_name") or origin.get("chat_name") or origin.get("user_name") or chat_id or key,
+        "updatedAt": entry.get("updated_at", "")
+    })
+conversations.sort(key=lambda x: x.get("updatedAt", ""), reverse=True)
+channel_items = []
+for platform, items in channels.items():
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            chat_id = item.get("id") or item.get("chat_id") or ""
+            channel_items.append({
+                "target": f"{platform}:{chat_id}" if chat_id else platform,
+                "platform": platform,
+                "name": item.get("name") or item.get("display_name") or chat_id or platform,
+                "chatType": item.get("type", "")
+            })
+print(json.dumps({"conversations": conversations[:80], "channels": channel_items[:80]}, ensure_ascii=False))
+`;
+  return JSON.parse(await runWslPython(script));
+}
+
+async function listWindowsHermesConversations() {
+  const home = process.env.HERMES_HOME;
+  if (!home) return { conversations: [], channels: [] };
+  const sessionsPath = path.join(home, "sessions", "sessions.json");
+  const channelsPath = path.join(home, "channel_directory.json");
+  const sessions = await readJsonIfExists(sessionsPath, {});
+  const channels = await readJsonIfExists(channelsPath, {});
+  const conversations = Object.entries(sessions).map(([key, entry]) => {
+    const origin = entry.origin ?? {};
+    const platform = entry.platform ?? origin.platform ?? "";
+    const chatId = origin.chat_id ?? "";
+    return {
+      sessionKey: key,
+      target: platform && chatId ? `${platform}:${chatId}` : "",
+      platform,
+      chatType: entry.chat_type ?? origin.chat_type ?? "",
+      name: entry.display_name ?? origin.chat_name ?? origin.user_name ?? chatId ?? key,
+      updatedAt: entry.updated_at ?? ""
+    };
+  }).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+  const channelItems = [];
+  for (const [platform, items] of Object.entries(channels)) {
+    if (!Array.isArray(items)) continue;
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const chatId = item.id ?? item.chat_id ?? "";
+      channelItems.push({
+        target: chatId ? `${platform}:${chatId}` : platform,
+        platform,
+        name: item.name ?? item.display_name ?? chatId ?? platform,
+        chatType: item.type ?? ""
+      });
+    }
+  }
+  return { conversations: conversations.slice(0, 80), channels: channelItems.slice(0, 80) };
+}
+
+async function readJsonIfExists(file, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+async function sendHermesPlatformMessage(target, message, runtime = "auto") {
+  const mode = runtime === "windows" ? "windows" : "wsl";
+  const script = `
+import base64, json, sys
+from tools.send_message_tool import send_message_tool
+target = base64.b64decode(sys.argv[1]).decode("utf-8")
+message = base64.b64decode(sys.argv[2]).decode("utf-8")
+print(send_message_tool({"action": "send", "target": target, "message": message}))
+`;
+  const target64 = Buffer.from(target, "utf8").toString("base64");
+  const message64 = Buffer.from(message, "utf8").toString("base64");
+  const raw = mode === "wsl"
+    ? await runWslPython(script, [target64, message64])
+    : await runWindowsPython(script, [target64, message64]);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { raw };
+  }
+}
+
+function runWslPython(script, args = []) {
+  return runCommand("wsl", ["-d", "Ubuntu", "--", "bash", "-lc", `cd /home/hermes/.hermes/hermes-agent && ./venv/bin/python - ${args.map(shellQuote).join(" ")}`], script);
+}
+
+function runWindowsPython(script, args = []) {
+  const python = process.env.HERMES_HOME
+    ? path.join(process.env.HERMES_HOME, "hermes-agent", "venv", "Scripts", "python.exe")
+    : "python";
+  const cwd = process.env.HERMES_HOME ? path.join(process.env.HERMES_HOME, "hermes-agent") : rootDir;
+  return runCommand(python, ["-", ...args], script, cwd);
+}
+
+function runCommand(command, args, input = "", cwd = rootDir) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+        NO_COLOR: "1"
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(stripAnsi(stderr || stdout || `${command} exited with code ${code}`).trim()));
+    });
+    if (input) child.stdin.write(input);
+    child.stdin.end();
+  });
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function findHermesExecutable() {
+  if (process.env.HERMES_HOME) {
+    return path.join(process.env.HERMES_HOME, "hermes-agent", "venv", "Scripts", "hermes.exe");
+  }
+  return "hermes.exe";
+}
+
+async function runHermes(prompt, runtime = "wsl") {
+  hermesState.busy = true;
+  appBroadcast({ type: "hermes-state", state: readHermesState() });
+
+  try {
+    const settings = await readHermesSettings();
+    const result = runtime === "windows"
+      ? await runWindowsHermesChat(prompt, settings.sessionId)
+      : await runWslHermesChat(prompt, settings.sessionId);
+
+    if (result.sessionId && result.sessionId !== settings.sessionId) {
+      await writeHermesSettings({ sessionId: result.sessionId, runtime: runtime === "windows" ? "windows" : "wsl" });
+      appBroadcast({ type: "hermes-settings", settings: await readHermesSettings() });
+    }
+    return result.reply;
+  } finally {
+    hermesState.busy = false;
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
+  }
+}
+
+async function runWslHermesChat(prompt, sessionId = "") {
+  const script = `
+import base64, json, os, subprocess, sys
+prompt = base64.b64decode(sys.argv[1]).decode("utf-8")
+session_id = base64.b64decode(sys.argv[2]).decode("utf-8") if len(sys.argv) > 2 else ""
+cmd = ["./venv/bin/hermes", "chat", "-Q", "--source", "tool"]
+if session_id:
+    cmd += ["--resume", session_id]
+cmd += ["-q", prompt]
+env = dict(os.environ)
+env["PYTHONIOENCODING"] = "utf-8"
+env["PYTHONUTF8"] = "1"
+env["NO_COLOR"] = "1"
+proc = subprocess.run(cmd, cwd="/home/hermes/.hermes/hermes-agent", text=True, capture_output=True, env=env)
+print(json.dumps({"code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}, ensure_ascii=False))
+`;
+  const prompt64 = Buffer.from(prompt.slice(0, 24_000), "utf8").toString("base64");
+  const session64 = Buffer.from(sessionId, "utf8").toString("base64");
+  return parseHermesChatResult(JSON.parse(await runWslPython(script, [prompt64, session64])));
+}
+
+function runWindowsHermesChat(prompt, sessionId = "") {
+  return new Promise((resolve, reject) => {
+    const hermesExe = findHermesExecutable();
+    const args = ["chat", "-Q", "--source", "tool"];
+    if (sessionId) args.push("--resume", sessionId);
+    args.push("-q", prompt.slice(0, 24_000));
+    const child = spawn(hermesExe, args, {
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+        NO_COLOR: "1"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      try {
+        resolve(parseHermesChatResult({ code, stdout, stderr }));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+function parseHermesChatResult(result) {
+  const output = stripAnsi(result.stdout ?? "").trim();
+  const errorText = stripAnsi(result.stderr ?? "").trim();
+  const combined = [output, errorText].filter(Boolean).join("\n");
+  const sessionId = combined.match(/session_id:\s*([A-Za-z0-9_-]+)/i)?.[1] ?? "";
+  const reply = output
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*session_id:/i.test(line))
+    .filter((line) => !line.includes("Stripped provider prefix"))
+    .join("\n")
+    .trim();
+  if (Number(result.code) === 0 && reply) return { reply, sessionId };
+  throw new Error(errorText || reply || `Hermes exited with code ${result.code}`);
+}
+
+function stripAnsi(text) {
+  return String(text ?? "").replace(/\u001b\[[0-9;]*m/g, "");
 }
 
 function waitForTunnelUrl() {
