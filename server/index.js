@@ -19,6 +19,27 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 let tunnel = null;
 let tunnelUrl = "";
 let tunnelLog = "";
+const HERMES_TEMPLATES = {
+  reliability: "Compare these replies and identify which answer is most reliable. Explain the evidence, uncertainty, and weak claims.",
+  missingPoints: "Find important omissions, blind spots, and risks across these replies. Explain what should be added.",
+  finalSummary: "Create a clear final summary that combines the strongest points from all replies and gives a complete conclusion.",
+  critique: "Critique these replies. Point out mistakes, unsupported claims, contradictions, and where each answer is weak.",
+  actionPlan: "Extract a practical action plan from these replies. Prioritize concrete next steps and decisions."
+};
+const HERMES_TEMPLATE_LABELS = {
+  reliability: "可靠性分析",
+  missingPoints: "遗漏点分析",
+  finalSummary: "最终汇总",
+  critique: "批判性检查",
+  actionPlan: "行动计划"
+};
+const HERMES_TEMPLATE_STATUS = {
+  reliability: "比较这些回复，判断哪个答案更可靠，并说明证据、不确定性和薄弱说法。",
+  missingPoints: "找出这些回复里的遗漏点、盲区和风险，并说明还应该补充什么。",
+  finalSummary: "整合所有回复里的强项，生成一份清晰完整的最终结论。",
+  critique: "检查这些回复里的错误、缺少证据的说法、矛盾点和薄弱处。",
+  actionPlan: "从这些回复中整理可执行步骤，并按优先级给出下一步建议。"
+};
 const hermesState = {
   context: [],
   lastReply: "",
@@ -89,6 +110,22 @@ app.post("/api/agents/:id/read", async (req, res) => {
   }
 });
 
+app.post("/api/agents/:id/diagnose", async (req, res) => {
+  try {
+    res.json(await manager.diagnoseAgent(req.params.id));
+  } catch (error) {
+    const status = /timeout/i.test(error.message) ? "超时" : "读回失败";
+    res.status(400).json({
+      agentId: req.params.id,
+      ok: false,
+      repaired: false,
+      status,
+      checks: [],
+      message: error.message || status
+    });
+  }
+});
+
 app.post("/api/chat/send", async (req, res) => {
   const { message = "", shareContext = false, images = [], files = [] } = req.body ?? {};
   if (
@@ -108,6 +145,30 @@ app.post("/api/chat/send", async (req, res) => {
     res.status(400).json({ error: error.message });
   } finally {
     await cleanupAttachments(attachments);
+  }
+});
+
+app.get("/api/config/export", async (_req, res) => {
+  try {
+    res.json({
+      ...(await manager.exportConfiguration()),
+      hermes: await readHermesSettings()
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/config/import", async (req, res) => {
+  try {
+    const result = await manager.importConfiguration(req.body ?? {});
+    if (req.body?.hermes && typeof req.body.hermes === "object") {
+      const settings = await writeHermesSettings(req.body.hermes);
+      appBroadcast({ type: "hermes-settings", settings });
+    }
+    res.json({ ...result, hermes: await readHermesSettings() });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
@@ -148,22 +209,23 @@ app.post("/api/hermes/send", async (req, res) => {
     const settings = await readHermesSettings();
     if (settings.target) {
       const result = await sendHermesPlatformMessage(settings.target, message.trim(), settings.runtime);
-      rememberHermesContext("user", `发送到 ${settings.targetLabel || settings.target}`, message.trim());
-      hermesState.lastReply = `已发送到 ${settings.targetLabel || settings.target}`;
+      rememberHermesContext("user", `Sent to ${settings.targetLabel || settings.target}`, message.trim());
+      hermesState.lastReply = `Sent to ${settings.targetLabel || settings.target}`;
       hermesState.lastError = "";
       appBroadcast({ type: "hermes-state", state: readHermesState() });
       res.json({ reply: hermesState.lastReply, result, state: readHermesState() });
       return;
     }
 
+    rememberHermesContext("user", "Sent to Hermes", message.trim());
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
     const reply = await runHermes([
-      "你是网页 AI 群聊里的 Hermes 分析助手。",
-      "请直接回复用户这条消息：",
+      "You are the Hermes assistant inside a web AI group chat.",
+      "Reply directly to this user message:",
       "",
       message.trim()
     ].join("\n"), settings.runtime);
-    rememberHermesContext("user", "发送给 Hermes", message.trim());
-    rememberHermesContext("hermes", "Hermes 回复", reply);
+    rememberHermesContext("hermes", "Hermes reply", reply);
     hermesState.lastReply = reply;
     hermesState.lastError = "";
     appBroadcast({ type: "hermes-state", state: readHermesState() });
@@ -177,6 +239,11 @@ app.post("/api/hermes/send", async (req, res) => {
 
 app.post("/api/hermes/analyze", async (req, res) => {
   const instruction = typeof req.body?.instruction === "string" ? req.body.instruction.trim() : "";
+  const template = typeof req.body?.template === "string" ? req.body.template : "";
+  const templateInstruction = HERMES_TEMPLATES[template] ?? "";
+  const templateLabel = HERMES_TEMPLATE_LABELS[template] ?? "";
+  const templateStatus = HERMES_TEMPLATE_STATUS[template] ?? "";
+  const finalInstruction = [templateInstruction, instruction].filter(Boolean).join("\n");
   const settings = await manager.readSettings();
   const collected = (await manager.listAgents())
     .slice(0, settings.displayCount)
@@ -190,8 +257,6 @@ app.post("/api/hermes/analyze", async (req, res) => {
       time: new Date().toLocaleTimeString()
     }));
 
-  hermesState.context = collected;
-
   const context = collected
     .map((item) => [`[${item.time}] ${item.title}`, item.text].join("\n"))
     .join("\n\n---\n\n");
@@ -203,14 +268,25 @@ app.post("/api/hermes/analyze", async (req, res) => {
 
   try {
     const hermesSettings = await readHermesSettings();
+    rememberHermesContext(
+      "status",
+      templateLabel || "自定义分析",
+      [
+        `已读取：${collected.map((item) => item.title).join("、")}`,
+        `状态：本次收集到 ${collected.length} 个 AI 回复。`,
+        templateStatus ? `分析要求：${templateStatus}` : "",
+        !templateStatus && instruction ? `分析要求：${instruction}` : ""
+      ].filter(Boolean).join("\n")
+    );
+    appBroadcast({ type: "hermes-state", state: readHermesState() });
     const reply = await runHermes([
-      "你是网页 AI 群聊里的 Hermes 总分析助手。",
-      "下面是用户消息和所有 AI 已读回的回复。请全文分析，提炼共同结论、主要分歧、遗漏风险、可执行建议，最后给出一份清晰完整的综合结论。",
-      instruction ? `用户本次分析要求：${instruction}` : "",
+      "You are the Hermes summary and analysis assistant inside a web AI group chat.",
+      "The following content contains replies read back from the AI models. Analyze them and provide a clear, complete conclusion.",
+      finalInstruction ? `User analysis request: ${finalInstruction}` : "",
       "",
       context
     ].join("\n"), hermesSettings.runtime);
-    rememberHermesContext("hermes", "Hermes 全文分析", reply);
+    rememberHermesContext("hermes", "Hermes full analysis", reply);
     hermesState.lastReply = reply;
     hermesState.lastError = "";
     appBroadcast({ type: "hermes-state", state: readHermesState() });
@@ -777,7 +853,7 @@ async function saveIncomingAttachments(images, files) {
 
 async function saveIncomingImages(images) {
   if (!Array.isArray(images) || images.length === 0) return [];
-  if (images.length > 1) throw new Error("一次最多发送 1 张图片");
+  if (images.length > 1) throw new Error("Send at most 1 image at a time");
 
   await fs.mkdir(uploadDir, { recursive: true });
   const saved = [];
@@ -785,24 +861,24 @@ async function saveIncomingImages(images) {
     const name = sanitizeFileName(image?.name ?? "image.png");
     const mimeType = typeof image?.type === "string" ? image.type : "";
     const dataUrl = typeof image?.dataUrl === "string" ? image.dataUrl : "";
-    if (!mimeType.startsWith("image/")) throw new Error("只能发送图片文件");
+    if (!mimeType.startsWith("image/")) throw new Error("Only image files are supported");
 
     const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-    if (!match) throw new Error("图片数据无效");
+    if (!match) throw new Error("Invalid image data");
 
     const buffer = Buffer.from(match[2], "base64");
-    if (buffer.length > 10 * 1024 * 1024) throw new Error("图片不能超过 10MB");
+    if (buffer.length > 10 * 1024 * 1024) throw new Error("Image must be 10MB or smaller");
 
     const filePath = path.join(uploadDir, `${Date.now()}-${crypto.randomUUID()}-${name}`);
     await fs.writeFile(filePath, buffer);
-    saved.push({ name, mimeType, path: filePath, kind: "图片" });
+    saved.push({ name, mimeType, path: filePath, kind: "Image" });
   }
   return saved;
 }
 
 async function saveIncomingFiles(files) {
   if (!Array.isArray(files) || files.length === 0) return [];
-  if (files.length > 5) throw new Error("一次最多发送 5 个文件");
+  if (files.length > 5) throw new Error("Send at most 5 files at a time");
 
   await fs.mkdir(uploadDir, { recursive: true });
   const saved = [];
@@ -810,17 +886,17 @@ async function saveIncomingFiles(files) {
     const name = sanitizeFileName(file?.name ?? "file");
     const mimeType = typeof file?.type === "string" ? file.type : "application/octet-stream";
     const dataUrl = typeof file?.dataUrl === "string" ? file.dataUrl : "";
-    if (!isAllowedDocument(name)) throw new Error("支持 PDF、Word、Excel、PPT、TXT、CSV 文件");
+    if (!isAllowedDocument(name)) throw new Error("Supported files: PDF, Word, Excel, PPT, TXT, CSV, Markdown");
 
     const match = dataUrl.match(/^data:([^;]*);base64,(.+)$/);
-    if (!match) throw new Error("文件数据无效");
+    if (!match) throw new Error("Invalid file data");
 
     const buffer = Buffer.from(match[2], "base64");
-    if (buffer.length > 25 * 1024 * 1024) throw new Error("文件不能超过 25MB");
+    if (buffer.length > 25 * 1024 * 1024) throw new Error("File must be 25MB or smaller");
 
     const filePath = path.join(uploadDir, `${Date.now()}-${crypto.randomUUID()}-${name}`);
     await fs.writeFile(filePath, buffer);
-    saved.push({ name, mimeType, path: filePath, kind: "文件" });
+    saved.push({ name, mimeType, path: filePath, kind: "File" });
   }
   return saved;
 }
@@ -838,3 +914,4 @@ function isAllowedDocument(name) {
   const lowerName = String(name).toLowerCase();
   return [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".md"].some((extension) => lowerName.endsWith(extension));
 }
+

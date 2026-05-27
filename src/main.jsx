@@ -3,15 +3,23 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const statusLabels = {
-  unopened: "未打开",
-  opening: "打开中",
-  ready: "可发送",
-  sending: "发送中",
-  waiting: "等待回复",
-  reading: "读取中",
-  done: "完成",
-  error: "失败"
+  unopened: "Closed",
+  opening: "Opening",
+  ready: "Ready",
+  sending: "Sending",
+  waiting: "Waiting",
+  reading: "Reading",
+  done: "Done",
+  error: "Error"
 };
+
+const hermesAnalysisTemplates = [
+  { key: "reliability", label: "Reliability" },
+  { key: "missingPoints", label: "Missing Points" },
+  { key: "finalSummary", label: "Final Summary" },
+  { key: "critique", label: "Critique" },
+  { key: "actionPlan", label: "Action Plan" }
+];
 
 const statusTone = {
   unopened: "idle",
@@ -32,6 +40,9 @@ function App() {
   const [accessMode, setAccessMode] = useState("local");
   const [message, setMessage] = useState("");
   const [image, setImage] = useState(null);
+  const [screenshotDraft, setScreenshotDraft] = useState(null);
+  const [cropSelection, setCropSelection] = useState(null);
+  const [cropDrag, setCropDrag] = useState(null);
   const [fileAttachments, setFileAttachments] = useState([]);
   const [shareContext, setShareContext] = useState(false);
   const [history, setHistory] = useState([]);
@@ -40,12 +51,14 @@ function App() {
   const [error, setError] = useState("");
   const [copiedReplyId, setCopiedReplyId] = useState("");
   const [readingAgentId, setReadingAgentId] = useState("");
+  const [diagnosingAgentId, setDiagnosingAgentId] = useState("");
+  const [diagnosticResults, setDiagnosticResults] = useState({});
   const [compareDialog, setCompareDialog] = useState(null);
   const [compareTargetId, setCompareTargetId] = useState("");
-  const [compareInstruction, setCompareInstruction] = useState("请分析对方回答，并和你自己上一条回答做对比，指出共同点、差异、优缺点，最后给出更好的综合答案。");
+  const [compareInstruction, setCompareInstruction] = useState("Compare the other answer with your previous answer. Point out agreements, differences, strengths, weaknesses, and give a better combined answer.");
   const [summaryDialog, setSummaryDialog] = useState(null);
   const [summarySourceIds, setSummarySourceIds] = useState([]);
-  const [summaryInstruction, setSummaryInstruction] = useState("请综合这些 AI 的回答，提炼共同结论、主要分歧、各自优缺点，最后给出一份更完整、更可靠的汇总答案。");
+  const [summaryInstruction, setSummaryInstruction] = useState("Combine these AI replies, extract common conclusions, main disagreements, strengths, weaknesses, and provide a more complete and reliable summary.");
   const [ruleDialog, setRuleDialog] = useState(null);
   const [rulePrompt, setRulePrompt] = useState("");
   const [hermesMode, setHermesMode] = useState(false);
@@ -59,6 +72,9 @@ function App() {
   const [hermesWindow, setHermesWindow] = useState(() => readHermesWindow());
   const [hermesMaximized, setHermesMaximized] = useState(false);
   const dragState = useRef(null);
+  const backupInputRef = useRef(null);
+  const screenshotImageRef = useRef(null);
+  const hermesChatRef = useRef(null);
 
   useEffect(() => {
     loadInitialState();
@@ -76,6 +92,7 @@ function App() {
       }
       if (data.type === "chat-result") {
         setAgents((items) => items.map((item) => item.id === data.agentId ? { ...item, lastReply: data.reply, lastError: "" } : item));
+        setDiagnosticResults((items) => ({ ...items, [data.agentId]: "Read back" }));
       }
       if (data.type === "chat-error") {
         setAgents((items) => items.map((item) => item.id === data.agentId ? { ...item, lastError: data.error } : item));
@@ -85,11 +102,22 @@ function App() {
         setHistory([]);
         setAgents((items) => items.map((item) => ({ ...item, lastSent: "", lastReply: "", lastError: "" })));
       }
-      if (data.type === "hermes-state") setHermesState(data.state);
+      if (data.type === "hermes-state") {
+        setHermesState(data.state);
+        if (data.state?.context?.length) setHermesOpen(true);
+      }
       if (data.type === "hermes-settings") setHermesSettings(data.settings);
     });
     return () => socket.close();
   }, []);
+
+  useEffect(() => {
+    const element = hermesChatRef.current;
+    if (!element || !hermesOpen) return;
+    requestAnimationFrame(() => {
+      element.scrollTop = element.scrollHeight;
+    });
+  }, [hermesState.context.length, hermesState.lastReply, hermesState.busy, hermesOpen]);
 
   const visibleAgents = useMemo(() => agents.slice(0, settings.displayCount), [agents, settings.displayCount]);
   const enabledCount = useMemo(() => visibleAgents.filter((agent) => agent.enabled).length, [visibleAgents]);
@@ -97,6 +125,12 @@ function App() {
   const localAddress = useMemo(() => chooseLanAddress(network), [network]);
   const activeUrl = accessMode === "internet" ? network.tunnelUrl : localAddress;
   const networkStopped = accessMode === "internet" && !network.tunnelUrl;
+  const activeCropBox = cropDrag ? {
+    left: Math.min(cropDrag.start.x, cropDrag.current.x),
+    top: Math.min(cropDrag.start.y, cropDrag.current.y),
+    width: Math.abs(cropDrag.current.x - cropDrag.start.x),
+    height: Math.abs(cropDrag.current.y - cropDrag.start.y)
+  } : cropSelection;
 
   async function loadInitialState() {
     const [agentsRes, modelsRes, settingsRes, networkRes, hermesRes, hermesSettingsRes] = await Promise.all([
@@ -233,7 +267,7 @@ function App() {
     setBusy(false);
   }
 
-  async function analyzeWithHermes(instruction = "") {
+  async function analyzeWithHermes(instruction = "", template = "") {
     if (busy || hermesState.busy || hermesReadableAgents.length === 0) return;
     setBusy(true);
     setError("");
@@ -241,7 +275,7 @@ function App() {
     const res = await fetch("/api/hermes/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instruction: analysisInstruction })
+      body: JSON.stringify({ instruction: analysisInstruction, template })
     });
     if (res.ok) {
       const data = await res.json();
@@ -249,7 +283,7 @@ function App() {
       setHermesOpen(true);
       if (analysisInstruction) setHermesDraft("");
     } else {
-      setError((await res.json()).error ?? "Hermes 分析失败");
+      setError((await res.json()).error ?? "Hermes analysis failed");
     }
     setBusy(false);
   }
@@ -356,6 +390,132 @@ function App() {
     }
   }
 
+  async function captureScreenshot() {
+    setError("");
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setError("Screenshot capture is not supported in this browser");
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      await video.play();
+      await new Promise((resolve) => {
+        if (video.videoWidth) resolve();
+        else video.onloadedmetadata = resolve;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      canvas.getContext("2d").drawImage(video, 0, 0);
+      const dataUrl = canvas.toDataURL("image/png");
+      const size = Math.round((dataUrl.length - "data:image/png;base64,".length) * 0.75);
+      if (size > 10 * 1024 * 1024) {
+        setError("Screenshot must be 10MB or smaller");
+        return;
+      }
+      setScreenshotDraft({ name: `screenshot-${Date.now()}.png`, type: "image/png", size, dataUrl, width: canvas.width, height: canvas.height });
+      setCropSelection(null);
+      setCropDrag(null);
+    } catch (error) {
+      if (error?.name !== "NotAllowedError") setError("Screenshot capture failed");
+    } finally {
+      stream?.getTracks().forEach((track) => track.stop());
+    }
+  }
+
+  function getScreenshotPoint(event) {
+    const element = screenshotImageRef.current;
+    if (!element || !screenshotDraft) return null;
+    const rect = element.getBoundingClientRect();
+    const stageRect = element.parentElement.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+    const y = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
+    return {
+      x: rect.left - stageRect.left + x,
+      y: rect.top - stageRect.top + y,
+      imageX: x / rect.width * screenshotDraft.width,
+      imageY: y / rect.height * screenshotDraft.height
+    };
+  }
+
+  function startScreenshotCrop(event) {
+    const point = getScreenshotPoint(event);
+    if (!point) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setCropDrag({ start: point, current: point });
+    setCropSelection(null);
+  }
+
+  function moveScreenshotCrop(event) {
+    if (!cropDrag) return;
+    const point = getScreenshotPoint(event);
+    if (!point) return;
+    setCropDrag((value) => value ? { ...value, current: point } : value);
+  }
+
+  function endScreenshotCrop(event) {
+    if (!cropDrag) return;
+    const point = getScreenshotPoint(event) || cropDrag.current;
+    const left = Math.min(cropDrag.start.x, point.x);
+    const top = Math.min(cropDrag.start.y, point.y);
+    const width = Math.abs(point.x - cropDrag.start.x);
+    const height = Math.abs(point.y - cropDrag.start.y);
+    const imageLeft = Math.min(cropDrag.start.imageX, point.imageX);
+    const imageTop = Math.min(cropDrag.start.imageY, point.imageY);
+    const imageWidth = Math.abs(point.imageX - cropDrag.start.imageX);
+    const imageHeight = Math.abs(point.imageY - cropDrag.start.imageY);
+    setCropDrag(null);
+    if (width < 8 || height < 8 || imageWidth < 8 || imageHeight < 8) {
+      setCropSelection(null);
+      return;
+    }
+    setCropSelection({ left, top, width, height, imageLeft, imageTop, imageWidth, imageHeight });
+  }
+
+  async function applyScreenshotCrop(useFull = false) {
+    if (!screenshotDraft) return;
+    const selection = useFull ? {
+      imageLeft: 0,
+      imageTop: 0,
+      imageWidth: screenshotDraft.width,
+      imageHeight: screenshotDraft.height
+    } : cropSelection;
+    if (!selection) {
+      setError("Drag to select an area first");
+      return;
+    }
+    const source = new Image();
+    source.src = screenshotDraft.dataUrl;
+    await new Promise((resolve, reject) => {
+      source.onload = resolve;
+      source.onerror = reject;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(selection.imageWidth));
+    canvas.height = Math.max(1, Math.round(selection.imageHeight));
+    canvas.getContext("2d").drawImage(
+      source,
+      selection.imageLeft,
+      selection.imageTop,
+      selection.imageWidth,
+      selection.imageHeight,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+    const dataUrl = canvas.toDataURL("image/png");
+    const size = Math.round((dataUrl.length - "data:image/png;base64,".length) * 0.75);
+    setImage({ name: screenshotDraft.name, type: "image/png", size, dataUrl });
+    setScreenshotDraft(null);
+    setCropSelection(null);
+    setCropDrag(null);
+  }
+
   async function selectFiles(fileList) {
     setError("");
     const selectedFiles = Array.from(fileList ?? []);
@@ -448,6 +608,62 @@ function App() {
     setReadingAgentId("");
   }
 
+
+  async function diagnoseAgent(agent) {
+    if (diagnosingAgentId) return;
+    setError("");
+    setDiagnosingAgentId(agent.id);
+    const res = await fetch(`/api/agents/${agent.id}/diagnose`, { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      setDiagnosticResults((items) => ({ ...items, [agent.id]: data.status || data.message || "Diagnosis complete" }));
+      if (!data.ok) setError(`${agent.name} ${data.message || "Diagnosis found an issue"}`);
+    } else {
+      const message = data.status || data.message || data.error || "Diagnosis failed";
+      setDiagnosticResults((items) => ({ ...items, [agent.id]: message }));
+      setError(`${agent.name} ${message}`);
+    }
+    setDiagnosingAgentId("");
+  }
+
+  async function exportConfig() {
+    setError("");
+    const res = await fetch("/api/config/export");
+    if (!res.ok) {
+      setError((await res.json()).error ?? "Export config failed");
+      return;
+    }
+    const data = await res.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `web-ai-group-chat-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importConfig(file) {
+    if (!file) return;
+    setError("");
+    try {
+      const text = await file.text();
+      const backup = JSON.parse(text);
+      const res = await fetch("/api/config/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backup)
+      });
+      if (!res.ok) {
+        setError((await res.json()).error ?? "Import config failed");
+        return;
+      }
+      await loadInitialState();
+    } catch (error) {
+      setError(error.message || "Import config failed");
+    }
+  }
+
   function openCompareDialog(agent) {
     const target = visibleAgents.find((item) => item.id !== agent.id && item.lastReply);
     setError("");
@@ -538,59 +754,57 @@ function App() {
     <main className="app-shell">
       <section className="composer">
         <div className="title-area">
-          <h1>网页 AI 群聊</h1>
+          <h1>Web AI Group Chat</h1>
           <span className="account-email">zhengxiaodong117@gmail.com</span>
         </div>
         <div className="top-controls">
           <label className="count-control">
-            显示数量
+            Display
             <select value={settings.displayCount} onChange={(event) => updateSettings({ displayCount: Number(event.target.value) })}>
               {[1, 2, 3, 4, 5].map((count) => <option value={count} key={count}>{count}</option>)}
             </select>
           </label>
-          <span className="enabled-count">{enabledCount} 个已启用</span>
+          <span className="enabled-count">{enabledCount} enabled</span>
           <label className="count-control">
-            发送方式
+            Send mode
             <select value={settings.sendMode} onChange={(event) => updateSettings({ sendMode: event.target.value })}>
-              <option value="parallel">并发</option>
-              <option value="polling">轮询</option>
+              <option value="parallel">Parallel</option>
+              <option value="polling">Polling</option>
             </select>
           </label>
           <label className="switch">
             <input type="checkbox" checked={shareContext} onChange={(event) => setShareContext(event.target.checked)} />
             <span />
-            让 AI 知道彼此存在
+            Share context
           </label>
         </div>
 
         <section className="access-card">
           <div className="access-compact">
             <div className="access-title">
-              <span className="access-icon">⌁</span>
-              <strong>访问方式</strong>
+              <strong>Access</strong>
             </div>
             <div className="access-tabs">
-              <button className={accessMode === "local" ? "active" : ""} onClick={() => setAccessMode("local")}>⌁ 本地网络</button>
-              <button className={accessMode === "internet" ? "active" : ""} onClick={() => setAccessMode("internet")}>◎ 互联网</button>
+              <button className={accessMode === "local" ? "active" : ""} onClick={() => setAccessMode("local")}>Local</button>
+              <button className={accessMode === "internet" ? "active" : ""} onClick={() => setAccessMode("internet")}>Internet</button>
             </div>
             <div className="access-url-row">
-              <span className="link-icon">↪</span>
-              <span className="access-url">{activeUrl || (accessMode === "internet" ? "未生成互联网链接" : "未检测到本地网络地址")}</span>
-              <button className="copy-button" disabled={!activeUrl} onClick={copyActiveUrl}>⧉</button>
+              <span className="access-url">{activeUrl || (accessMode === "internet" ? "No internet link yet" : "No local address detected")}</span>
+              <button className="copy-button" disabled={!activeUrl} onClick={copyActiveUrl} title="Copy access link" aria-label="Copy access link">
+                Copy
+              </button>
             </div>
             {accessMode === "internet" && (
               <div className="access-actions inline-actions">
-                <button disabled={networkBusy} onClick={startTunnel}>{network.tunnelUrl ? "重新生成链接" : "生成链接"}</button>
-                <button disabled={networkBusy || !network.tunnelUrl} onClick={stopTunnel}>关闭链接</button>
+                <button disabled={networkBusy} onClick={startTunnel}>{network.tunnelUrl ? "Regenerate" : "Generate"}</button>
+                <button disabled={networkBusy || !network.tunnelUrl} onClick={stopTunnel}>Close link</button>
               </div>
             )}
             <span className={`access-state ${networkStopped ? "stopped" : "running"}`}>
               {networkStopped ? "stopped" : "ready"}
             </span>
             <span className="access-help inline-help">
-              {accessMode === "local"
-                ? "同一 WiFi 下访问"
-                : "临时公网链接，电脑需保持开机联网"}
+              {accessMode === "local" ? "Same Wi-Fi access" : "Temporary public link; keep this computer online."}
             </span>
           </div>
         </section>
@@ -599,7 +813,7 @@ function App() {
           <textarea
             value={message}
             onChange={(event) => setMessage(event.target.value)}
-            placeholder="输入要同时发送给网页 AI 的消息"
+            placeholder="Type a message to send to the web AI models"
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
@@ -642,6 +856,10 @@ function App() {
               <IconImage />
               Image
             </label>
+            <button className="icon-text-button" disabled={busy} onClick={captureScreenshot} title="Screenshot">
+              <IconScreenshot />
+              Screenshot
+            </button>
             <label className="attach-button" title="File">
               <input type="file" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/csv,text/markdown" onChange={(event) => {
                 selectFiles(event.target.files);
@@ -666,6 +884,18 @@ function App() {
               <IconClear />
               Clear
             </button>
+            <button className="icon-text-button" disabled={busy} onClick={exportConfig} title="Export config">
+              <IconDownload />
+              Export
+            </button>
+            <label className="attach-button" title="Import config">
+              <input ref={backupInputRef} type="file" accept="application/json,.json" onChange={(event) => {
+                importConfig(event.target.files?.[0]);
+                event.target.value = "";
+              }} />
+              <IconUpload />
+              Import
+            </label>
             {error && <span className="error-text">{error}</span>}
           </div>
         </section>
@@ -678,42 +908,46 @@ function App() {
               <select className="model-select" value={agent.modelKey ?? ""} onChange={(event) => selectModel(agent.id, event.target.value)}>
                 {models.map((model) => <option value={model.modelKey} key={model.modelKey}>{model.name}</option>)}
               </select>
-              <input className="url-input" value={agent.url} placeholder="https:// 或 http://localhost:11434/..." onChange={(event) => updateAgent(agent.id, { url: event.target.value })} />
-              <span className={`status ${statusTone[agent.status] ?? "idle"}`}>{statusLabels[agent.status] ?? "未打开"}</span>
+              <input className="url-input" value={agent.url} placeholder="https:// or http://localhost:11434/..." onChange={(event) => updateAgent(agent.id, { url: event.target.value })} />
+              <span className={`status ${statusTone[agent.status] ?? "idle"}`}>{statusLabels[agent.status] ?? "Closed"}</span>
             </div>
             <div className="agent-toolbar">
               <label className="check-line">
                 <input type="checkbox" checked={agent.enabled} onChange={(event) => updateAgent(agent.id, { enabled: event.target.checked })} />
-                启用
+                Enable
               </label>
-              <button onClick={() => openAgent(agent.id)}>打开网页/本地模型页</button>
-              <button className={agent.systemPrompt ? "rule-button active" : "rule-button"} onClick={() => openRuleDialog(agent)} title="规则提示">
+              <button onClick={() => openAgent(agent.id)}>Open page/model</button>
+              <button className={agent.systemPrompt ? "rule-button active" : "rule-button"} onClick={() => openRuleDialog(agent)} title="Rules">
                 <IconRules />
-                规则提示
+                Rules
               </button>
             </div>
             <ConversationBlock
-              sentText={agent.lastSent || "暂无"}
-              replyText={agent.lastReply || agent.lastError || "暂无"}
+              sentText={agent.lastSent || "None"}
+              replyText={agent.lastReply || agent.lastError || "None"}
               muted={!agent.lastReply && !agent.lastError}
               error={Boolean(agent.lastError && !agent.lastReply)}
               actions={(
                 <>
-                  <button className="icon-button" disabled={readingAgentId === agent.id} onClick={() => refreshAgentReply(agent)} title="重新读取答案" aria-label="重新读取答案">
+                  <button className="icon-button" disabled={readingAgentId === agent.id} onClick={() => refreshAgentReply(agent)} title="Refresh reply" aria-label="Refresh reply">
                     <IconRefresh />
                   </button>
-                  <button className="icon-button" disabled={!agent.lastReply} onClick={() => copyAgentReply(agent)} title={copiedReplyId === agent.id ? "已复制" : "复制答案"} aria-label="复制答案">
+                  <button className="icon-button" disabled={diagnosingAgentId === agent.id} onClick={() => diagnoseAgent(agent)} title="Diagnose/repair" aria-label="Diagnose/repair">
+                    <IconDiagnose />
+                  </button>
+                  <button className="icon-button" disabled={!agent.lastReply} onClick={() => copyAgentReply(agent)} title={copiedReplyId === agent.id ? "Copied" : "Copy reply"} aria-label="Copy reply">
                     <IconCopy />
                   </button>
-                  <button className="icon-button" disabled={!agent.lastReply || busy} onClick={() => openCompareDialog(agent)} title="交换答案并对比" aria-label="交换答案并对比">
+                  <button className="icon-button" disabled={!agent.lastReply || busy} onClick={() => openCompareDialog(agent)} title="Exchange and compare" aria-label="Exchange and compare">
                     <IconCompare />
                   </button>
-                  <button className="icon-button" disabled={!agent.lastReply || busy} onClick={() => openSummaryDialog(agent)} title="汇总多个答案" aria-label="汇总多个答案">
+                  <button className="icon-button" disabled={!agent.lastReply || busy} onClick={() => openSummaryDialog(agent)} title="Summarize replies" aria-label="Summarize replies">
                     <IconSummary />
                   </button>
                 </>
               )}
             />
+            {diagnosticResults[agent.id] && <span className="diagnostic-note">{diagnosticResults[agent.id]}</span>}
           </article>
         ))}
       </section>
@@ -817,7 +1051,7 @@ function App() {
       {hermesOpen && (
         <aside
           className={hermesMaximized ? "hermes-float maximized" : "hermes-float"}
-          aria-label="Hermes 会话窗口"
+          aria-label="Hermes chat window"
           style={hermesMaximized ? undefined : {
             left: hermesWindow.left,
             top: hermesWindow.top,
@@ -828,36 +1062,33 @@ function App() {
           <div className="hermes-float-head" onPointerDown={startHermesDrag}>
             <div>
               <strong>Hermes</strong>
-              <span>{hermesState.busy ? "分析中" : hermesMode ? "发送到 Hermes" : "待命"}</span>
+              <span>{hermesState.busy ? "Analyzing" : hermesMode ? "Sending to Hermes" : "Standby"}</span>
             </div>
             <div className="hermes-head-actions">
-              <button className="text-button" disabled={hermesState.busy || hermesState.context.length === 0} onClick={clearHermes} title="Clear">
-                Clear
-              </button>
               <button className="icon-button" disabled={hermesConfigBusy} onClick={(event) => {
                 event.stopPropagation();
                 setHermesConfigOpen((value) => !value);
                 if (!hermesConfigOpen) refreshHermesTargets();
-              }} title="Hermes 配置" aria-label="Hermes 配置">
+              }} title="Hermes settings" aria-label="Hermes settings">
                 <IconSettings />
               </button>
-              <button className="icon-button" onClick={toggleHermesMaximize} title={hermesMaximized ? "还原" : "最大化"} aria-label={hermesMaximized ? "还原" : "最大化"}>
+              <button className="icon-button" onClick={toggleHermesMaximize} title={hermesMaximized ? "Restore" : "Maximize"} aria-label={hermesMaximized ? "Restore" : "Maximize"}>
                 {hermesMaximized ? <IconRestore /> : <IconMaximize />}
               </button>
-              <button className="icon-button" onClick={closeHermesPanel} title="关闭" aria-label="关闭">
+              <button className="icon-button" onClick={closeHermesPanel} title="Close" aria-label="Close">
                 <IconClose />
               </button>
             </div>
           </div>
-          {!hermesState.available && <div className="hermes-float-actions"><span className="error-text">未检测到 Hermes</span></div>}
+          {!hermesState.available && <div className="hermes-float-actions"><span className="error-text">Hermes not detected</span></div>}
           {hermesConfigOpen && (
             <div className="hermes-config">
               <div className="hermes-config-head">
-                <strong>WSL Hermes 连接配置</strong>
-                <button disabled={hermesConfigBusy} onClick={refreshHermesTargets}>{hermesConfigBusy ? "刷新中" : "刷新"}</button>
+                <strong>WSL Hermes connection</strong>
+                <button disabled={hermesConfigBusy} onClick={refreshHermesTargets}>{hermesConfigBusy ? "Refreshing" : "Refresh"}</button>
               </div>
               <label>
-                发送目标
+                Send target
                 <select
                   value={hermesSettings.target}
                   onChange={(event) => {
@@ -865,7 +1096,7 @@ function App() {
                     saveHermesTarget(event.target.value, option?.dataset.label ?? "");
                   }}
                 >
-                  <option value="" data-label="">独立 Hermes 对话（不发送到微信/飞书）</option>
+                  <option value="" data-label="">Independent Hermes chat</option>
                   {hermesTargets.conversations.map((item) => (
                     <option value={item.target} data-label={`${item.platform} ${item.name}`} key={item.sessionKey}>
                       {item.platform} / {item.chatType} / {item.name}
@@ -879,15 +1110,25 @@ function App() {
                 </select>
               </label>
               <span className="hermes-config-note">
-                当前：{hermesSettings.target ? `${hermesSettings.targetLabel || hermesSettings.target}` : `独立 Hermes 对话${hermesSettings.sessionId ? ` / ${hermesSettings.sessionId}` : ""}`}
+                Current: {hermesSettings.target ? `${hermesSettings.targetLabel || hermesSettings.target}` : `Independent Hermes chat${hermesSettings.sessionId ? ` / ${hermesSettings.sessionId}` : ""}`}
               </span>
               {hermesTargets.error && <span className="hermes-error">{hermesTargets.error}</span>}
             </div>
           )}
           {hermesState.lastError && <div className="hermes-error">{hermesState.lastError}</div>}
-          <div className="hermes-chat">
+          <div className="hermes-templates">
+            {hermesAnalysisTemplates.map((template) => (
+              <button key={template.key} disabled={busy || hermesState.busy || hermesReadableAgents.length === 0} onClick={() => analyzeWithHermes("", template.key)}>
+                {template.label}
+              </button>
+            ))}
+            <button className="clear-template-button" disabled={hermesState.busy || hermesState.context.length === 0} onClick={clearHermes} title="Clear">
+              Clear
+            </button>
+          </div>
+          <div className="hermes-chat" ref={hermesChatRef}>
             {hermesState.context.length === 0 ? (
-              <span className="empty-note">暂无会话。点亮 Hermes 后发送消息，或让 AI 回复后点 Analyze all。</span>
+              <span className="empty-note">No conversation yet. Send Hermes a message or use a template after AI replies are available.</span>
             ) : hermesState.context.map((item) => (
               <article className={`hermes-bubble ${item.role}`} key={item.id}>
                 <div>
@@ -896,6 +1137,8 @@ function App() {
                 </div>
                 {item.role === "ai" ? (
                   <span className="hermes-status-line">Collected for analysis</span>
+                ) : item.role === "status" ? (
+                  <pre className="hermes-compact-text">{item.text}</pre>
                 ) : (
                   <pre>{item.text}</pre>
                 )}
@@ -916,16 +1159,16 @@ function App() {
                 }}
               />
               <div className="hermes-compose-actions">
-                <button className="text-button" disabled={busy || hermesState.busy || hermesReadableAgents.length === 0} onClick={() => analyzeWithHermes(hermesDraft)} title="按输入要求分析主界面回复">
+                <button className="text-button" disabled={busy || hermesState.busy || hermesReadableAgents.length === 0} onClick={() => analyzeWithHermes(hermesDraft)} title="Analyze main replies with this instruction">
                   {hermesState.busy ? "Analyzing" : "Analyze"}
                 </button>
-                <button className="icon-button" disabled={!hermesDraft.trim() || busy || hermesState.busy} onClick={sendHermesDraft} title="发送给 Hermes" aria-label="发送给 Hermes">
+                <button className="icon-button" disabled={!hermesDraft.trim() || busy || hermesState.busy} onClick={sendHermesDraft} title="Send to Hermes" aria-label="Send to Hermes">
                   <IconSend />
                 </button>
               </div>
             </div>
           </div>
-          {!hermesMaximized && <div className="hermes-resize-grip" title="拖动调整大小" onPointerDown={(event) => {
+          {!hermesMaximized && <div className="hermes-resize-grip" title="Resize" onPointerDown={(event) => {
             event.preventDefault();
             const start = { x: event.clientX, y: event.clientY, width: hermesWindow.width, height: hermesWindow.height };
             const onMove = (moveEvent) => resizeHermesWindow(start.width + moveEvent.clientX - start.x, start.height + moveEvent.clientY - start.y);
@@ -938,10 +1181,48 @@ function App() {
           }} />}
         </aside>
       )}
-
+      {screenshotDraft && (
+        <div className="screenshot-overlay" role="dialog" aria-label="Crop screenshot">
+          <div className="screenshot-panel">
+            <div className="screenshot-head">
+              <strong>Crop screenshot</strong>
+              <span>Drag with the mouse to select an area</span>
+            </div>
+            <div
+              className="screenshot-stage"
+              onPointerDown={startScreenshotCrop}
+              onPointerMove={moveScreenshotCrop}
+              onPointerUp={endScreenshotCrop}
+              onPointerCancel={() => setCropDrag(null)}
+            >
+              <img ref={screenshotImageRef} src={screenshotDraft.dataUrl} alt="Screenshot preview" draggable="false" />
+              {activeCropBox && (
+                <div
+                  className="screenshot-selection"
+                  style={{
+                    left: activeCropBox.left,
+                    top: activeCropBox.top,
+                    width: activeCropBox.width,
+                    height: activeCropBox.height
+                  }}
+                />
+              )}
+            </div>
+            <div className="screenshot-actions">
+              <button onClick={() => {
+                setScreenshotDraft(null);
+                setCropSelection(null);
+                setCropDrag(null);
+              }}>Cancel</button>
+              <button onClick={() => applyScreenshotCrop(true)}>Use full</button>
+              <button className="primary" disabled={!cropSelection} onClick={() => applyScreenshotCrop(false)}>Use selection</button>
+            </div>
+          </div>
+        </div>
+      )}
       <section className="history">
-        <h2>最近发送</h2>
-        {history.length === 0 ? <p>暂无</p> : history.map((item) => <p key={item.id}><span>{item.time}</span>{item.message}</p>)}
+        <h2>Recent sends</h2>
+        {history.length === 0 ? <p>None</p> : history.map((item) => <p key={item.id}><span>{item.time}</span>{item.message}</p>)}
       </section>
     </main>
   );
@@ -1086,6 +1367,17 @@ function IconImage() {
   );
 }
 
+function IconScreenshot() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="6" cy="6" r="2.5" />
+      <circle cx="6" cy="18" r="2.5" />
+      <path d="M8.2 7.2L19 18" />
+      <path d="M8.2 16.8L19 6" />
+    </svg>
+  );
+}
+
 function IconFile() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1114,6 +1406,35 @@ function IconClear() {
       <path d="M19 6l-1 14H6L5 6" />
       <path d="M10 11v5" />
       <path d="M14 11v5" />
+    </svg>
+  );
+}
+
+function IconDiagnose() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4l-4.6 4.6a2 2 0 0 0 2.8 2.8l4.6-4.6a4 4 0 0 0 5.4-5.4" />
+      <path d="M15 5l4 4" />
+    </svg>
+  );
+}
+
+function IconDownload() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3v12" />
+      <path d="M7 10l5 5 5-5" />
+      <path d="M5 21h14" />
+    </svg>
+  );
+}
+
+function IconUpload() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 21V9" />
+      <path d="M7 14l5-5 5 5" />
+      <path d="M5 3h14" />
     </svg>
   );
 }

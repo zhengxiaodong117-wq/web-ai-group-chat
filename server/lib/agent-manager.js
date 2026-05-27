@@ -122,6 +122,76 @@ export class AgentManager {
     return { agentId: id, reply };
   }
 
+  async diagnoseAgent(id) {
+    const agent = await this.requireAgent(id);
+    const checks = [];
+    let repaired = false;
+    let page = this.pages.get(id);
+
+    if (!page || page.isClosed()) {
+      this.emitStatus(id, "opening");
+      page = await this.ensurePage(agent);
+      repaired = true;
+      checks.push({ name: "page", ok: true, message: "已打开模型网页" });
+    } else {
+      checks.push({ name: "page", ok: true, message: "模型网页已打开" });
+    }
+
+    if (!page.url() || page.url() === "about:blank") {
+      await page.goto(agent.url, { waitUntil: "domcontentloaded" });
+      repaired = true;
+      checks.push({ name: "navigation", ok: true, message: "已重新载入模型网址" });
+    } else {
+      checks.push({ name: "navigation", ok: true, message: page.url() });
+    }
+
+    const title = await page.title().catch(() => "");
+    const bodyText = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+    const loginSuspected = /登录|登入|sign in|log in|login|验证码|verify/i.test(`${title}\n${bodyText}`);
+    checks.push({ name: "login", ok: !loginSuspected, message: loginSuspected ? "可能需要登录或验证" : "未发现明显登录拦截" });
+
+    const inputResult = await this.firstVisible(page.locator(agent.selectors?.input ?? ""), "input", 5000).catch((error) => error);
+    const inputOk = !(inputResult instanceof Error);
+    checks.push({ name: "input", ok: inputOk, message: inputOk ? "发送框可用" : "找不到发送框" });
+
+    let sendOk = agent.submitMode === "enter";
+    if (agent.submitMode === "enter") {
+      checks.push({ name: "send", ok: true, message: "使用回车发送" });
+    } else {
+      const sendSelector = agent.selectors?.sendButton;
+      if (sendSelector) {
+        const sendResult = await this.firstVisible(page.locator(sendSelector), "send button", 5000).catch((error) => error);
+        sendOk = !(sendResult instanceof Error);
+        if (!sendOk && inputOk) sendOk = true;
+        checks.push({ name: "send", ok: sendOk, message: sendResult instanceof Error ? "未找到发送按钮，将使用 Enter 回退发送" : "发送按钮已找到" });
+      } else {
+        sendOk = inputOk;
+        checks.push({ name: "send", ok: sendOk, message: sendOk ? "未配置发送按钮，将使用 Enter 回退发送" : "未配置发送按钮选择器" });
+      }
+    }
+
+    try {
+      const reply = await this.safeReadLatestReply(page, agent);
+      if (reply) {
+        checks.push({ name: "reply", ok: true, message: "已读取到网页回复" });
+        if (!this.lastReplies.get(id)) {
+          this.lastReplies.set(id, reply);
+          this.broadcast({ type: "chat-result", agentId: id, agentName: agent.name, reply });
+          repaired = true;
+        }
+      } else {
+        checks.push({ name: "reply", ok: false, message: "暂未读取到回复" });
+      }
+    } catch (error) {
+      checks.push({ name: "reply", ok: false, message: error.message });
+    }
+
+    const ok = inputOk && sendOk && !loginSuspected;
+    const status = ok ? (repaired ? "已修复" : "正常") : (loginSuspected ? "需要登录" : (!inputOk ? "找不到发送框" : (!sendOk ? "发送按钮异常" : "读回失败")));
+    this.emitStatus(id, ok ? "ready" : "error");
+    return { agentId: id, ok, repaired, status, checks, message: status };
+  }
+
   async sendToEnabledAgents(message, shareContext, attachments = []) {
     const settings = await this.readSettings();
     const agents = (await this.readConfig()).slice(0, settings.displayCount).filter((agent) => agent.enabled);
@@ -184,6 +254,39 @@ export class AgentManager {
     return { ok: true };
   }
 
+  async exportConfiguration() {
+    return {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      agents: await this.readConfig(),
+      settings: await this.readSettings()
+    };
+  }
+
+  async importConfiguration(value) {
+    if (!value || typeof value !== "object") throw new Error("Backup file is invalid");
+    if (!Array.isArray(value.agents)) throw new Error("Backup file is missing agents");
+
+    const agents = value.agents.slice(0, 5).map((agent) => ({
+      ...agent,
+      name: sanitizeString(agent.name, "AI"),
+      url: sanitizeString(agent.url, ""),
+      enabled: Boolean(agent.enabled),
+      submitMode: sanitizeSubmitMode(agent.submitMode, "auto"),
+      systemPrompt: sanitizeOptionalString(agent.systemPrompt, ""),
+      selectors: agent.selectors && typeof agent.selectors === "object" ? agent.selectors : {}
+    }));
+    await this.writeConfig(agents);
+
+    if (value.settings && typeof value.settings === "object") {
+      await this.updateSettings(value.settings);
+    }
+
+    const currentAgents = await this.listAgents();
+    this.broadcast({ type: "agents", agents: currentAgents });
+    return { agents: currentAgents, settings: await this.readSettings() };
+  }
+
   async sendOne(agent, message, attachments = []) {
     try {
       if (!agent.url) throw new Error("URL is empty");
@@ -214,7 +317,7 @@ export class AgentManager {
   normalizeOutgoingMessage(agent, message, attachments) {
     if (message?.trim()) return message;
     if (attachments?.length && agent.modelKey === "gemini") {
-      return "请分析我上传的文件，并给出清晰、完整的结论。";
+      return "Please analyze the uploaded file and provide a clear, complete conclusion.";
     }
     return message;
   }
@@ -225,10 +328,10 @@ export class AgentManager {
 
     const body = typeof message === "string" ? message.trim() : "";
     return [
-      "请严格遵守以下规则提示：",
+      "Strictly follow these standing instructions:",
       rule,
       "",
-      "用户消息：",
+      "User message:",
       body
     ].join("\n");
   }
@@ -408,7 +511,7 @@ export class AgentManager {
   }
 
   formatSentMessage(message, attachments) {
-    const attachmentLines = (attachments ?? []).map((item) => `[${item.kind ?? "附件"}: ${item.name}]`);
+    const attachmentLines = (attachments ?? []).map((item) => `[${item.kind ?? "Attachment"}: ${item.name}]`);
     return [message, ...attachmentLines].filter(Boolean).join("\n");
   }
 
@@ -551,12 +654,12 @@ function sanitizeSubmitMode(value, fallback) {
 
 function sanitizeCompareInstruction(value) {
   const text = typeof value === "string" ? value.trim() : "";
-  return text || "请分析对方回答，并和你自己上一条回答做对比，指出共同点、差异、优缺点，最后给出更好的综合答案。";
+  return text || "Compare the other answer with your previous answer. Point out agreements, differences, strengths, weaknesses, and give a better combined answer.";
 }
 
 function sanitizeSummaryInstruction(value) {
   const text = typeof value === "string" ? value.trim() : "";
-  return text || "请综合这些 AI 的回答，提炼共同结论、主要分歧、各自优缺点，最后给出一份更完整、更可靠的汇总答案。";
+  return text || "Combine these AI replies, extract common conclusions, main disagreements, strengths, weaknesses, and provide a more complete and reliable summary.";
 }
 
 function scoreFileInput(accept, attachment) {

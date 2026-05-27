@@ -3,7 +3,7 @@
     "id": "ai-1",
     "modelKey": "chatgpt",
     "name": "ChatGPT",
-    "enabled": false,
+    "enabled": true,
     "url": "https://chatgpt.com/",
     "submitMode": "auto",
     "selectors": {
@@ -11,13 +11,14 @@
       "uploadInput": "input[type='file']",
       "sendButton": "button[data-testid='send-button'], button[aria-label*='Send'], button[aria-label*='发送'], button[type='submit']",
       "reply": "[data-message-author-role='assistant'], .markdown"
-    }
+    },
+    "systemPrompt": ""
   },
   {
     "id": "ai-2",
     "modelKey": "gemini",
     "name": "Gemini",
-    "enabled": false,
+    "enabled": true,
     "url": "https://gemini.google.com/",
     "submitMode": "auto",
     "selectors": {
@@ -27,7 +28,8 @@
       "uploadMenuItem": "[role='menuitem']:has-text('Upload files'), [role='menuitem']:has-text('上传文件'), button:has-text('Upload files'), button:has-text('上传文件'), div:has-text('Upload files'), div:has-text('上传文件')",
       "sendButton": "button[aria-label*='Send'], button[aria-label*='发送'], button[aria-label*='Submit'], button[aria-label*='提交'], button[type='submit'], button[class*='send']",
       "reply": "model-response message-content, model-response .markdown, model-response .model-response-text, model-response"
-    }
+    },
+    "systemPrompt": ""
   },
   {
     "id": "ai-3",
